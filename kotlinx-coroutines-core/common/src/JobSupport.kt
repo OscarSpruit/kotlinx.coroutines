@@ -125,6 +125,8 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
        ---------------------------------------------------------------------------------
      */
 
+    private val stateTrace = Trace(64, traceFormatDefault)
+
     // Note: use shared objects while we have no listeners
     private val _state = atomic<Any?>(if (active) EMPTY_ACTIVE else EMPTY_NEW)
 
@@ -192,18 +194,34 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
 
     // ------------ state update ------------
 
+    private val _called = atomic(0)
+
     // Finalizes Finishing -> Completed (terminal state) transition.
     // ## IMPORTANT INVARIANT: Only one thread can be concurrently invoking this method.
     // Returns final state that was created and updated to
     private fun finalizeFinishingState(state: Finishing, proposedUpdate: Any?): Any? {
+        stateTrace { "finalizeFinishingState: proposedUpdate = $proposedUpdate" }
         /*
          * Note: proposed state can be Incomplete, e.g.
          * async {
          *     something.invokeOnCompletion {} // <- returns handle which implements Incomplete under the hood
          * }
          */
-        assert { this.state === state } // consistency check -- it cannot change
-        assert { !state.isSealed } // consistency check -- cannot be sealed yet
+        if (_called.getAndIncrement() > 0) {
+            println("!!!!")
+        }
+        try {
+            assert { this.state === state }
+        } catch(e: AssertionError) {
+            println("!!!! $stateTrace")
+            throw  e
+        }
+        try {
+            assert { !state.isSealed } // consistency check -- cannot be sealed yet
+        } catch(e: AssertionError) {
+            println("!!!! $stateTrace")
+            throw e
+        }
         assert { state.isCompleting } // consistency check -- must be marked as completing
         val proposedException = (proposedUpdate as? CompletedExceptionally)?.cause
         // Create the final exception and seal the state so that no more exceptions can be added
@@ -215,6 +233,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
             if (finalCause != null) addSuppressedExceptions(finalCause, exceptions)
             finalCause
         }
+        stateTrace { "finalizeFinishingState: finalException = $finalException, state.isSealed" }
         // Create the final state object
         val finalState = when {
             // was not cancelled (no exception) -> use proposed update value
@@ -224,9 +243,11 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
             // cancelled job final state
             else -> CompletedExceptionally(finalException)
         }
+        stateTrace { "finalizeFinishingState: finalState = $finalState" }
         // Now handle the final exception
         if (finalException != null) {
             val handled = cancelParent(finalException) || handleJobException(finalException)
+            stateTrace { "finalizeFinishingState: handled = $handled" }
             if (handled) (finalState as CompletedExceptionally).makeHandled()
         }
         // Process state updates for the final state before the state of the Job is actually set to the final state
@@ -235,6 +256,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
         onCompletionInternal(finalState)
         // Then CAS to completed state -> it must succeed
         val casSuccess = _state.compareAndSet(state, finalState.boxIncomplete())
+        stateTrace { "finalizeFinishingState: _state.compareAndSet: state -> $finalState" }
         assert { casSuccess }
         // And process all post-completion actions
         completeStateFinalization(state, finalState)
@@ -298,6 +320,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
 
     // suppressed == true when any exceptions were suppressed while building the final completion cause
     private fun completeStateFinalization(state: Incomplete, update: Any?) {
+        stateTrace { "completeStateFinalization update = $update" }
         /*
          * Now the job in THE FINAL state. We need to properly handle the resulting state.
          * Order of various invocations here is important.
@@ -306,6 +329,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
          */
         parentHandle?.let {
             it.dispose() // volatile read parentHandle _after_ state was updated
+            stateTrace { "completeStateFinalization parentHandle $parentHandle was disposed" }
             parentHandle = NonDisposableHandle // release it just in case, to aid GC
         }
         val cause = (update as? CompletedExceptionally)?.cause
@@ -327,6 +351,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
     private fun notifyCancelling(list: NodeList, cause: Throwable) {
         // first cancel our own children
         onCancelling(cause)
+        stateTrace { "notifyCancelling: cause = $cause" }
         notifyHandlers<JobCancellingNode<*>>(list, cause)
         // then cancel parent
         cancelParent(cause) // tentative cancellation -- does not matter if there is no parent
@@ -343,17 +368,19 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
         // Is scoped coroutine -- don't propagate, will be rethrown
         if (isScopedCoroutine) return true
 
+        //stateTrace { "cancelParent: cause = $cause" }
         /* CancellationException is considered "normal" and parent usually is not cancelled when child produces it.
          * This allow parent to cancel its children (normally) without being cancelled itself, unless
          * child crashes and produce some other exception during its completion.
          */
         val isCancellation = cause is CancellationException
         val parent = parentHandle
+        //stateTrace { "cancelParent: cause = $cause, parent = $parent" }
         // No parent -- ignore CE, report other exceptions.
         if (parent === null || parent === NonDisposableHandle) {
+            //stateTrace { "cancelParent: return isCancellation = $isCancellation" }
             return isCancellation
         }
-
         // Notify parent but don't forget to check cancellation
         return parent.childCancelled(cause) || isCancellation
     }
@@ -366,6 +393,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
         list.forEach<T> { node ->
             try {
                 node.invoke(cause)
+                stateTrace { "notifyHandlers: node = $node, cause = $cause INVOKED" }
             } catch (ex: Throwable) {
                 exception?.apply { addSuppressedThrowable(ex) } ?: run {
                     exception =  CompletionHandlerException("Exception in completion handler $node for $this", ex)
@@ -393,6 +421,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
             is Empty -> { // EMPTY_X state -- no completion handlers
                 if (state.isActive) return FALSE // already active
                 if (!_state.compareAndSet(state, EMPTY_ACTIVE)) return RETRY
+                 //stateTrace { "startInternal: _state.compareAndSet($state, EMPTY_ACTIVE" }
                 onStartInternal()
                 return TRUE
             }
@@ -455,12 +484,14 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
     ): DisposableHandle {
         var nodeAdded: JobNode<*>? = null
         loopOnState { state ->
+            stateTrace { "invokeOnCompletion: handler = $handler" }
             when (state) {
                 is Empty -> { // EMPTY_X state -- no completion handlers
                     if (state.isActive) {
                         // try move to SINGLE state
                         val node = makeNode(handler, onCancelling)
                         if (_state.compareAndSet(state, node)) {
+                             //stateTrace { "invokeOnCompletion: _state.compareAndSet($state, $$node)" }
                             nodeAdded = node
                             return node
                         }
@@ -497,8 +528,10 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
                             // Note: attachChild uses invokeImmediately, so it gets invoked when adding to cancelled job
                             if (invokeImmediately) { // todo check that nodeAdded != null
                                 if (nodeAdded != null) {
+                                     //stateTrace { "invokeOnCompletion: nodeAdded = $nodeAdded, rootCause = $rootCause was INVOKED" }
                                     nodeAdded!!.invoke(rootCause)
                                 } else {
+                                    //stateTrace { "invokeOnCompletion: handler = $handler, rootCause = $rootCause was INVOKED" }
                                     handler.invokeIt(rootCause)
                                 }
                             }
@@ -516,8 +549,10 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
                     // because we play type tricks on Kotlin/JS and handler is not necessarily a function there
                     if (invokeImmediately) {
                         if (nodeAdded != null) {
+                            //stateTrace { "invokeOnCompletion: nodeAdded = $nodeAdded, state = $state was INVOKED" }
                             nodeAdded!!.invoke((state as? CompletedExceptionally)?.cause)
                         } else {
+                            //stateTrace { "invokeOnCompletion: handler = $handler, state = $state was INVOKED" }
                             handler.invokeIt((state as? CompletedExceptionally)?.cause)
                         }
                     }
@@ -537,9 +572,12 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
     }
 
     private fun addLastAtomic(expect: Any, list: NodeList, node: JobNode<*>): Boolean {
+        //return list.addLastIf(node) { this.state === expect }
         list.addLast(node)
+        stateTrace { "addLastAtomic, node = $node, this.state = ${this.state}" }
         if (this.state === expect) return true
         node.dispose()
+        stateTrace { "addLastAtomic FAILED, this.state = ${this.state}, expect = $expect" }
         return false
     }
 
@@ -548,6 +586,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
         val list = NodeList()
         val update = if (state.isActive) list else InactiveNodeList(list)
         _state.compareAndSet(state, update)
+        //stateTrace { "promoteEmptyToNodeList: _state.compareAndSet($state, $update)" }
     }
 
     private fun promoteSingleToNodeList(state: JobNode<*>) {
@@ -557,6 +596,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
         val list = state.nextNode // either our NodeList or somebody else won the race, updated state
         // just attempt converting it to list if state is still the same, then we'll continue lock-free loop
         _state.compareAndSet(state, list)
+        //stateTrace { "promoteSingleToNodeList: _state.compareAndSet($state, $list)" }
     }
 
     public final override suspend fun join() {
@@ -612,7 +652,10 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
                 is JobNode<*> -> { // SINGE/SINGLE+ state -- one completion handler
                     if (state !== node) return // a different job node --> we were already removed
                     // try remove and revert back to empty state
-                    if (_state.compareAndSet(state, EMPTY_ACTIVE)) return
+                    if (_state.compareAndSet(state, EMPTY_ACTIVE)) {
+                        //stateTrace { "removeNode: _state.compareAndSet($state, EMPTY_ACTIVE)" }
+                        return
+                    }
                 }
                 is Incomplete -> { // may have a list of completion handlers
                     // remove node from the list if there is a list
@@ -649,11 +692,13 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
 
     // It is overridden in channel-linked implementation
     public open fun cancelInternal(cause: Throwable) {
+        //stateTrace { "cancelInternal: cause = $cause" }
         cancelImpl(cause)
     }
 
     // Parent is cancelling child
     public final override fun parentCancelled(parentJob: ParentJob) {
+        //stateTrace { "parentCancelled" }
         cancelImpl(parentJob)
     }
 
@@ -668,6 +713,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
      */
     public open fun childCancelled(cause: Throwable): Boolean {
         if (cause is CancellationException) return true
+         stateTrace { "childCancelled, cause = $cause, this = $this" }
         return cancelImpl(cause) && handlesException
     }
 
@@ -675,12 +721,16 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
      * Makes this [Job] cancelled with a specified [cause].
      * It is used in [AbstractCoroutine]-derived classes when there is an internal failure.
      */
-    public fun cancelCoroutine(cause: Throwable?): Boolean = cancelImpl(cause)
+    public fun cancelCoroutine(cause: Throwable?): Boolean {
+        //stateTrace { "cancelCoroutine, cause = $cause" }
+        return cancelImpl(cause)
+    }
 
     // cause is Throwable or ParentJob when cancelChild was invoked
     // returns true is exception was handled, false otherwise
     internal fun cancelImpl(cause: Any?): Boolean {
         var finalState: Any? = COMPLETING_ALREADY
+         stateTrace { "cancelImpl: cause = $cause, onCancelComplete = $onCancelComplete" }
         if (onCancelComplete) {
             // make sure it is completing, if cancelMakeCompleting returns state it means it had make it
             // completing and had recorded exception
@@ -712,6 +762,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
                 // already completed/completing, do not even create exception to propose update
                 return COMPLETING_ALREADY
             }
+            stateTrace { "cancelMakeCompleting, cause = $cause, state = $state" }
             val proposedUpdate = CompletedExceptionally(createCauseException(cause))
             val finalState = tryMakeCompleting(state, proposedUpdate)
             if (finalState !== COMPLETING_RETRY) return finalState
@@ -750,12 +801,15 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
     private fun makeCancelling(cause: Any?): Any? {
         var causeExceptionCache: Throwable? = null // lazily init result of createCauseException(cause)
         loopOnState { state ->
+            stateTrace { "makeCancelling: cause = $cause, this = $this" }
             when (state) {
                 is Finishing -> { // already finishing -- collect exceptions
+                    stateTrace { "makeCancelling: cause = $cause, this = $this, state is Finishing" }
                     val notifyRootCause = synchronized(state) {
                         if (state.isSealed) return TOO_LATE_TO_CANCEL // already sealed -- cannot add exception nor mark cancelled
                         // add exception, do nothing is parent is cancelling child that is already being cancelled
                         val wasCancelling = state.isCancelling // will notify if was not cancelling
+                        stateTrace { "makeCancelling: cause = $cause, this = $this, wasCancelling = $wasCancelling" }
                         // Materialize missing exception if it is the first exception (otherwise -- don't)
                         if (cause != null || !wasCancelling) {
                             val causeException = causeExceptionCache ?: createCauseException(cause).also { causeExceptionCache = it }
@@ -764,18 +818,21 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
                         // take cause for notification if was not in cancelling state before
                         state.rootCause.takeIf { !wasCancelling }
                     }
+                    stateTrace { "makeCancelling: cause = $cause, this = $this, notifyRootCause = $notifyRootCause" }
                     notifyRootCause?.let { notifyCancelling(state.list, it) }
                     return COMPLETING_ALREADY
                 }
                 is Incomplete -> {
                     // Not yet finishing -- try to make it cancelling
                     val causeException = causeExceptionCache ?: createCauseException(cause).also { causeExceptionCache = it }
+                    stateTrace { "makeCancelling: cause = $cause, this = $this, state is Incomplete, causeException = $causeException" }
                     if (state.isActive) {
                         // active state becomes cancelling
                         if (tryMakeCancelling(state, causeException)) return COMPLETING_ALREADY
                     } else {
                         // non active state starts completing
                         val finalState = tryMakeCompleting(state, CompletedExceptionally(causeException))
+                        stateTrace { "makeCancelling: cause = $cause, this = $this, state is Incomplete, finalState = $finalState" }
                         when {
                             finalState === COMPLETING_ALREADY -> error("Cannot happen in $state")
                             finalState === COMPLETING_RETRY -> return@loopOnState
@@ -783,7 +840,10 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
                         }
                     }
                 }
-                else -> return TOO_LATE_TO_CANCEL // already complete
+                else -> {
+                    stateTrace { "makeCancelling: cause = $cause, this = $this TOO_LATE_TO_CANCEL" }
+                    return TOO_LATE_TO_CANCEL
+                } // already complete
             }
         }
     }
@@ -811,8 +871,8 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
         // Create cancelling state (with rootCause!)
         val cancelling = Finishing(list, false, rootCause)
         val res = _state.compareAndSet(state, cancelling)
-        //println("-- tryMakeCancelling job = $this, State.CAS($state, $cancelling) = $res")
         if (!res) return false
+        stateTrace { "tryMakeCancelling: _state.compareAndSet -> Finishing(), list = $list, rootCause = $rootCause" }
         // Notify listeners
         notifyCancelling(list, rootCause)
         return true
@@ -847,6 +907,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
      */
     internal fun makeCompletingOnce(proposedUpdate: Any?): Any? {
         loopOnState { state ->
+            //stateTrace { "makeCompletingOnce: proposedUpdate = $proposedUpdate, this = $this" }
             val finalState = tryMakeCompleting(state, proposedUpdate)
             when {
                 finalState === COMPLETING_ALREADY ->
@@ -866,6 +927,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
     // COMPLETING_WAITING_CHILDREN -- when made completing and is waiting for children
     // final state -- when completed, for call to afterCompletion
     private fun tryMakeCompleting(state: Any?, proposedUpdate: Any?): Any? {
+        //stateTrace { "tryMakeCompleting, proposedUpdate = $proposedUpdate" }
         if (state !is Incomplete)
             return COMPLETING_ALREADY
         /*
@@ -875,7 +937,6 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
          * which may miss unhandled exception.
          */
         if ((state is Empty || state is JobNode<*>) && state !is ChildHandleNode && proposedUpdate !is CompletedExceptionally) {
-            //println("-- tryMakeCompleting, state = $state, FAST PATH")
             if (tryFinalizeSimpleState(state, proposedUpdate)) {
                 // Completed successfully on fast path -- return updated state
                 return proposedUpdate
@@ -893,6 +954,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
     // COMPLETING_WAITING_CHILDREN -- when made completing and is waiting for children
     // final state -- when completed, for call to afterCompletion
     private fun tryMakeCompletingSlowPath(state: Incomplete, proposedUpdate: Any?): Any? {
+        stateTrace { "tryMakeCompletingSlowPath: proposedUpdate = $proposedUpdate" }
         // get state's list or else promote to list to correctly operate on child lists
         val list = getOrPromoteCancellingList(state) ?: return COMPLETING_RETRY
         // promote to Finishing state if we are not in it yet
@@ -912,6 +974,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
             // (if somebody else is faster) and we synchronize all the threads on this finishing lock asap.
             if (finishing !== state) {
                 val res = _state.compareAndSet(state, finishing)
+                 //stateTrace { "tryMakeCompletingSlowPath: _state.compareAndSet($state, $finishing)" }
                 if (!res) return COMPLETING_RETRY
             }
             // ## IMPORTANT INVARIANT: Only one thread (that had set isCompleting) can go past this point
@@ -922,12 +985,16 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
             // If it just becomes cancelling --> must process cancelling notifications
             notifyRootCause = finishing.rootCause.takeIf { !wasCancelling }
         }
+        stateTrace { "tryMakeCompletingSlowPath: notifyRootCause = $notifyRootCause" }
         // process cancelling notification here -- it cancels all the children _before_ we start to to wait them (sic!!!)
         notifyRootCause?.let { notifyCancelling(list, it) }
         // now wait for children
         val child = firstChild(state)
-        if (child != null && tryWaitForChild(finishing, child, proposedUpdate))
+        //stateTrace { "tryMakeCompletingSlowPath: finishing = $finishing, child = $child" }
+        if (child != null && tryWaitForChild(finishing, child, proposedUpdate)) {
+            //stateTrace { "tryMakeCompletingSlowPath: COMPLETING_WAITING_CHILDREN" }
             return COMPLETING_WAITING_CHILDREN
+        }
         // otherwise -- we have not children left (all were already cancelled?)
         return finalizeFinishingState(finishing, proposedUpdate)
     }
@@ -953,12 +1020,18 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
 
     // ## IMPORTANT INVARIANT: Only one thread can be concurrently invoking this method.
     private fun continueCompleting(state: Finishing, lastChild: ChildHandleNode, proposedUpdate: Any?) {
-        assert { this.state === state } // consistency check -- it cannot change while we are waiting for children
+        stateTrace { "continueCompleting, lastChild = $lastChild, proposedUpdate = $proposedUpdate, state = $state" }
+        try {
+            assert { this.state === state } // consistency check -- it cannot change while we are waiting for children
+        } catch(e: AssertionError) {
+            throw e
+        }
         // figure out if we need to wait for next child
         val waitChild = lastChild.nextChild()
+        stateTrace { "continueCompleting, waitChild = $waitChild" }
         // try wait for next child
         if (waitChild != null && tryWaitForChild(state, waitChild, proposedUpdate)) return // waiting for next child
-        // no more children to wait -- try update state
+        // no more children to wait -- try update statez
         val finalState = finalizeFinishingState(state, proposedUpdate)
         afterCompletion(finalState)
     }
@@ -1434,7 +1507,6 @@ private class ResumeOnCompletion(
     private val _invoked = atomic(false)
     override fun invoke(cause: Throwable?) {
         if (_invoked.compareAndSet(false, true)) {
-            //println("ResumeOnCompletion invoked, cont = $continuation will be invoked: resume(Unit)")
             continuation.resume(Unit)
         }
     }

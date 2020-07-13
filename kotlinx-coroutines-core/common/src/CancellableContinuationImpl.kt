@@ -29,6 +29,8 @@ internal open class CancellableContinuationImpl<in T>(
 ) : DispatchedTask<T>(resumeMode), CancellableContinuation<T>, CoroutineStackFrame {
     public override val context: CoroutineContext = delegate.context
 
+    private val _cancellableContTrace = Trace(64)
+
     /*
      * Implementation notes
      *
@@ -111,6 +113,7 @@ internal open class CancellableContinuationImpl<in T>(
      * and from [suspendCancellableCoroutine] to establish a cancellation before registering CC anywhere.
      */
     private fun setupCancellation() {
+        _cancellableContTrace { "setupCancellation" }
         if (checkCompleted()) return
         if (parentHandle !== null) return // fast path 2 -- was already initialized
         val parent = delegate.context[Job] ?: return // fast path 3 -- don't do anything without parent
@@ -120,10 +123,12 @@ internal open class CancellableContinuationImpl<in T>(
             handler = ChildContinuation(parent, this).asHandler
         )
         parentHandle = handle
+        _cancellableContTrace { "setupCancellation   parentHandle = $handle, parent = ${parent}" }
         // now check our state _after_ registering (could have completed while we were registering)
         // Also note that we do not dispose parent for reusable continuations, dispatcher will do that for us
         if (isCompleted && !isReusable()) {
             handle.dispose() // it is Ok to call dispose twice -- here and in disposeParentHandle
+            _cancellableContTrace { "setupCancellation  handle was disposed" }
             parentHandle = NonDisposableHandle // release it just in case, to aid GC
         }
     }
@@ -165,21 +170,29 @@ internal open class CancellableContinuationImpl<in T>(
     }
 
     public override fun cancel(cause: Throwable?): Boolean {
+        _cancellableContTrace { "cancel cause = $cause" }
         _state.loop { state ->
-            if (state !is NotCompleted) return false // false if already complete or cancelling
+            if (state !is NotCompleted) {
+                _cancellableContTrace { "cancel state !is NotCompleted -> false" }
+                return false
+            }
+            // false if already complete or cancelling
             // Active -- update to final state
             val update = CancelledContinuation(this, cause, handled = state is CancelHandler)
             if (!_state.compareAndSet(state, update)) return@loop // retry on cas failure
+            _cancellableContTrace { "cancel _state.CAS to update = $update" }
             // Invoke cancel handler if it was present
             if (state is CancelHandler) invokeHandlerSafely { state.invoke(cause) }
             // Complete state update
             detachChildIfNonResuable()
             dispatchResume(mode = MODE_ATOMIC_DEFAULT)
+            _cancellableContTrace { "cancel _state.CAS to update = $update" }
             return true
         }
     }
 
     internal fun parentCancelled(cause: Throwable) {
+        _cancellableContTrace { "parentCancelled, cause = $cause" }
         if (cancelLater(cause)) return
         cancel(cause)
         // Even if cancellation has failed, we should detach child to avoid potential leak
